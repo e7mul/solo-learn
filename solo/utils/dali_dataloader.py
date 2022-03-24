@@ -185,6 +185,7 @@ class NormalPipeline(Pipeline):
         num_shards: int = 1,
         num_threads: int = 4,
         seed: int = 12,
+        data_percent: Union[None, float] = None,
     ):
         """Initializes the pipeline for validation or linear eval training.
 
@@ -204,6 +205,7 @@ class NormalPipeline(Pipeline):
             num_shards (int): total number of shards. Defaults to 1.
             num_threads (int): number of threads to run in parallel. Defaults to 4.
             seed (int): seed for random number generation. Defaults to 12.
+            data_percent (float, optional): percentage of data to use.
         """
 
         seed += device_id
@@ -212,12 +214,38 @@ class NormalPipeline(Pipeline):
         self.device = device
         self.validation = validation
 
-        self.reader = ops.readers.File(
-            file_root=data_path,
-            shard_id=shard_id,
-            num_shards=num_shards,
-            shuffle_after_epoch=not self.validation,
-        )
+        if data_percent is not None:
+            assert 0 < data_percent <= 1.0
+
+            labels = sorted(Path(entry.name) for entry in os.scandir(data_path) if entry.is_dir())
+            data = [
+                (data_path / label / file, label_idx)
+                for label_idx, label in enumerate(labels)
+                for file in sorted(os.listdir(data_path / label))
+            ]
+            files = [f for f, _ in data]
+            labels = [l for _, l in data]
+
+            from sklearn.model_selection import train_test_split
+
+            files, _, labels, _ = train_test_split(
+                files, labels, train_size=data_percent, stratify=labels, random_state=42
+            )
+            self.reader = ops.readers.File(
+                files=files,
+                shard_id=shard_id,
+                num_shards=num_shards,
+                shuffle_after_epoch=not self.validation,
+                labels=labels,
+            )
+        else:
+            self.reader = ops.readers.File(
+                file_root=data_path,
+                shard_id=shard_id,
+                num_shards=num_shards,
+                shuffle_after_epoch=not self.validation,
+            )
+
         decoder_device = "mixed" if self.device == "gpu" else "cpu"
         device_memory_padding = 211025920 if decoder_device == "mixed" else 0
         host_memory_padding = 140544512 if decoder_device == "mixed" else 0
@@ -514,6 +542,7 @@ class PretrainPipeline(Pipeline):
         seed: int = 12,
         no_labels: bool = False,
         encode_indexes_into_labels: bool = False,
+        data_percent: Union[None, float] = None,
     ):
         """Initializes the pipeline for pretraining.
 
@@ -535,6 +564,7 @@ class PretrainPipeline(Pipeline):
             encode_indexes_into_labels (bool, optional): uses sample indexes as labels
                 and then gets the labels from a lookup table. This may use more CPU memory,
                 so just use when needed. Defaults to False.
+            data_percent (float, optional): percentage of data to use.
         """
 
         seed += device_id
@@ -548,7 +578,31 @@ class PretrainPipeline(Pipeline):
         self.device = device
 
         data_path = Path(data_path)
-        if no_labels:
+        if data_percent is not None:
+            assert 0 < data_percent <= 1.0
+
+            labels = sorted(Path(entry.name) for entry in os.scandir(data_path) if entry.is_dir())
+            data = [
+                (data_path / label / file, label_idx)
+                for label_idx, label in enumerate(labels)
+                for file in sorted(os.listdir(data_path / label))
+            ]
+            files = [f for f, _ in data]
+            labels = [l for _, l in data]
+
+            from sklearn.model_selection import train_test_split
+
+            files, _, labels, _ = train_test_split(
+                files, labels, train_size=data_percent, stratify=labels, random_state=42
+            )
+            self.reader = ops.readers.File(
+                files=files,
+                shard_id=shard_id,
+                num_shards=num_shards,
+                shuffle_after_epoch=random_shuffle,
+                labels=labels,
+            )
+        elif no_labels:
             files = [data_path / f for f in sorted(os.listdir(data_path))]
             labels = [-1] * len(files)
             self.reader = ops.readers.File(

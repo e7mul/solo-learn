@@ -41,7 +41,7 @@ We start by importing everything that we will need (we will be relying on Pytorc
     # and some utilities to perform data loading for the method itself, including augmentation pipelines
     from solo.utils.pretrain_dataloader import (
         prepare_dataloader,
-        prepare_datasets,
+        prepare_dataset,
         prepare_n_crop_transform,
         prepare_transform,
     )
@@ -124,7 +124,7 @@ Now, let's create all the necessary data loaders.
     transform = prepare_n_crop_transform(transform, num_crops_per_aug=[2])
 
     # finally, we produce the Dataset/Dataloader classes
-    train_dataset = prepare_datasets(
+    train_dataset = prepare_dataset(
         "cifar10",
         transform,
         data_dir="./",

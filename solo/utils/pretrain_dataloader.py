@@ -21,11 +21,12 @@ import os
 import random
 from pathlib import Path
 from typing import Any, Callable, List, Optional, Sequence, Type, Union
+from sklearn.model_selection import train_test_split
 
 import torch
 import torchvision
 from PIL import Image, ImageFilter, ImageOps
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 from torch.utils.data.dataset import Dataset
 from torchvision import transforms
 from torchvision.datasets import STL10, ImageFolder
@@ -471,12 +472,13 @@ def prepare_n_crop_transform(
     return FullTransformPipeline(T)
 
 
-def prepare_datasets(
+def prepare_dataset(
     dataset: str,
     transform: Callable,
     data_dir: Optional[Union[str, Path]] = None,
     train_dir: Optional[Union[str, Path]] = None,
     no_labels: Optional[Union[str, Path]] = False,
+    data_percent: Optional[float] = None,
     download: bool = True,
 ) -> Dataset:
     """Prepares the desired dataset.
@@ -489,6 +491,7 @@ def prepare_datasets(
         train_dir (Optional[Union[str, Path]], optional): training data directory
             to be appended to data_dir. Defaults to None.
         no_labels (Optional[bool], optional): if the custom dataset has no labels.
+        data_percent (float, optional): percentage of data to use.
 
     Returns:
         Dataset: the desired dataset with transformations.
@@ -533,6 +536,19 @@ def prepare_datasets(
             dataset_class = ImageFolder
 
         train_dataset = dataset_with_index(dataset_class)(train_dir, transform)
+
+    if data_percent is not None:
+        assert 0 < data_percent <= 1.0
+
+        if dataset == "stl10":
+            targets = train_dataset.labels
+        else:
+            targets = train_dataset.targets
+
+        indices, _ = train_test_split(
+            range(len(dataset)), train_size=data_percent, stratify=targets, random_state=42
+        )
+        train_dataset = Subset(train_dataset, indices)
 
     return train_dataset
 

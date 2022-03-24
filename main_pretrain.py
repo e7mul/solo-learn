@@ -49,7 +49,7 @@ from solo.utils.checkpointer import Checkpointer
 from solo.utils.classification_dataloader import prepare_data as prepare_data_classification
 from solo.utils.pretrain_dataloader import (
     prepare_dataloader,
-    prepare_datasets,
+    prepare_dataset,
     prepare_n_crop_transform,
     prepare_transform,
 )
@@ -89,12 +89,13 @@ def main():
             print("Transforms:")
             pprint(transform)
 
-        train_dataset = prepare_datasets(
+        train_dataset = prepare_dataset(
             args.dataset,
             transform,
             data_dir=args.data_dir,
             train_dir=args.train_dir,
             no_labels=args.no_labels,
+            data_percent=args.data_percent,
         )
         train_loader = prepare_dataloader(
             train_dataset, batch_size=args.batch_size, num_workers=args.num_workers

@@ -21,7 +21,7 @@ import numpy as np
 from PIL import Image
 from solo.utils.pretrain_dataloader import (
     prepare_dataloader,
-    prepare_datasets,
+    prepare_dataset,
     prepare_n_crop_transform,
     prepare_transform,
 )
@@ -91,7 +91,7 @@ def test_data():
 
     T = [prepare_transform("cifar10", **kwargs)]
     T = prepare_n_crop_transform(T, num_crops_per_aug=[2])
-    train_dataset = prepare_datasets("cifar10", T, data_dir=None)
+    train_dataset = prepare_dataset("cifar10", T, data_dir=None)
 
     assert isinstance(train_dataset, CIFAR10)
     assert len(train_dataset[0]) == 3

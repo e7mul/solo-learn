@@ -159,6 +159,9 @@ class PretrainABC(ABC):
         # hack to encode image indexes into the labels
         self.encode_indexes_into_labels = self.extra_args["encode_indexes_into_labels"]
 
+        # use only part of the dataset
+        data_percent = self.extra_args["data_percent"]
+
         # handle custom data by creating the needed pipeline
         dataset = self.extra_args["dataset"]
         if dataset in ["imagenet100", "imagenet"]:
@@ -191,6 +194,7 @@ class PretrainABC(ABC):
             num_threads=num_workers,
             no_labels=self.extra_args["no_labels"],
             encode_indexes_into_labels=self.encode_indexes_into_labels,
+            data_percent=data_percent,
         )
         output_map = (
             [f"large{i}" for i in range(self.num_large_crops)]
@@ -231,6 +235,9 @@ class ClassificationABC(ABC):
         data_dir = Path(self.extra_args["data_dir"])
         train_dir = Path(self.extra_args["train_dir"])
 
+        # use only part of the dataset
+        data_percent = self.extra_args["data_percent"]
+
         # handle custom data by creating the needed pipeline
         dataset = self.extra_args["dataset"]
         if dataset in ["imagenet100", "imagenet"]:
@@ -249,6 +256,7 @@ class ClassificationABC(ABC):
             shard_id=shard_id,
             num_shards=num_shards,
             num_threads=num_workers,
+            data_percent=data_percent,
         )
         train_loader = Wrapper(
             train_pipeline,

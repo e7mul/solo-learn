@@ -90,9 +90,9 @@ prepare_n_crop_transform
 .. autofunction:: solo.utils.pretrain_dataloader.prepare_n_crop_transform
    :noindex:
 
-prepare_datasets
+prepare_dataset
 ~~~~~~~~~~~~~~~~
-.. autofunction:: solo.utils.pretrain_dataloader.prepare_datasets
+.. autofunction:: solo.utils.pretrain_dataloader.prepare_dataset
    :noindex:
 
 prepare_dataloader

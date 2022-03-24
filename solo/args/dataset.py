@@ -80,6 +80,9 @@ def augmentations_args(parser: ArgumentParser):
     # debug
     parser.add_argument("--debug_augmentations", action="store_true")
 
+    # percentage of training data to use (None means use all the data)
+    parser.add_argument("--data_percent", default=None, type=float)
+
 
 def linear_augmentations_args(parser: ArgumentParser):
     parser.add_argument("--crop_size", type=int, default=[224], nargs="+")
