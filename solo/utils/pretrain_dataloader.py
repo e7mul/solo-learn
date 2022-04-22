@@ -57,7 +57,10 @@ class CustomDatasetWithoutLabels(Dataset):
 
     def __getitem__(self, index):
         path = self.root / self.images[index]
-        x = Image.open(path).convert("RGB")
+        # open path as file to avoid ResourceWarning
+        # (https://github.com/python-pillow/Pillow/issues/835)
+        with open(path, "rb") as f:
+            x = Image.open(f).convert("RGB")
         if self.transform is not None:
             x = self.transform(x)
         return x, -1
