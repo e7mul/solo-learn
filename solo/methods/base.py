@@ -17,8 +17,6 @@
 # OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 # DEALINGS IN THE SOFTWARE.
 
-import os
-import warnings
 from argparse import ArgumentParser
 from functools import partial
 from typing import Any, Callable, Dict, List, Sequence, Tuple, Union
@@ -50,9 +48,8 @@ from solo.utils.backbones import (
 from solo.utils.knn import WeightedKNNClassifier
 from solo.utils.lars import LARSWrapper
 from solo.utils.metrics import accuracy_at_k, weighted_mean
-from solo.utils.misc import compute_dataset_size
 from solo.utils.momentum import MomentumUpdater, initialize_momentum_params
-from torch.optim.lr_scheduler import MultiStepLR
+from torch.optim.lr_scheduler import CosineAnnealingLR, MultiStepLR
 from torchvision.models import resnet18, resnet50
 
 
@@ -105,18 +102,16 @@ class BaseMethod(pl.LightningModule):
         accumulate_grad_batches: Union[int, None],
         extra_optimizer_args: Dict,
         scheduler: str,
+        min_lr: float,
+        warmup_start_lr: float,
+        warmup_epochs: float,
         num_large_crops: int,
         num_small_crops: int,
-        min_lr: float = 0.0,
-        warmup_start_lr: float = 0.00003,
-        warmup_epochs: float = 10,
-        scheduler_interval: str = "step",
         eta_lars: float = 1e-3,
         grad_clip_lars: bool = False,
         lr_decay_steps: Sequence = None,
         knn_eval: bool = False,
         knn_k: int = 20,
-        no_channel_last: bool = False,
         **kwargs,
     ):
         """Base model that implements all basic operations for all self-supervised methods.
@@ -146,22 +141,17 @@ class BaseMethod(pl.LightningModule):
             accumulate_grad_batches (Union[int, None]): number of batches for gradient accumulation.
             extra_optimizer_args (Dict): extra named arguments for the optimizer.
             scheduler (str): name of the scheduler.
+            min_lr (float): minimum learning rate for warmup scheduler.
+            warmup_start_lr (float): initial learning rate for warmup scheduler.
+            warmup_epochs (float): number of warmup epochs.
             num_large_crops (int): number of big crops.
             num_small_crops (int): number of small crops .
-            min_lr (float): minimum learning rate for warmup scheduler. Defaults to 0.0.
-            warmup_start_lr (float): initial learning rate for warmup scheduler.
-                Defaults to 0.00003.
-            warmup_epochs (float): number of warmup epochs. Defaults to 10.
-            scheduler_interval (str): interval to update the lr scheduler. Defaults to 'step'.
             eta_lars (float): eta parameter for lars.
             grad_clip_lars (bool): whether to clip the gradients in lars.
             lr_decay_steps (Sequence, optional): steps to decay the learning rate if scheduler is
                 step. Defaults to None.
             knn_eval (bool): enables online knn evaluation while training.
             knn_k (int): the number of neighbors to use for knn.
-            no_channel_last (bool). Disables channel last conversion operation which
-                speeds up training considerably. Defaults to False.
-                https://pytorch.org/tutorials/intermediate/memory_format_tutorial.html#converting-existing-models
 
         .. note::
             When using distributed data parallel, the batch size and the number of workers are
@@ -201,17 +191,12 @@ class BaseMethod(pl.LightningModule):
         self.min_lr = min_lr
         self.warmup_start_lr = warmup_start_lr
         self.warmup_epochs = warmup_epochs
-        assert scheduler_interval in ["step", "epoch"]
-        self.scheduler_interval = scheduler_interval
         self.num_large_crops = num_large_crops
         self.num_small_crops = num_small_crops
         self.eta_lars = eta_lars
         self.grad_clip_lars = grad_clip_lars
         self.knn_eval = knn_eval
         self.knn_k = knn_k
-        self.no_channel_last = no_channel_last
-
-        self._num_training_steps = None
 
         # multicrop
         self.num_crops = self.num_large_crops + self.num_small_crops
@@ -254,32 +239,12 @@ class BaseMethod(pl.LightningModule):
         else:
             self.features_dim = self.backbone.num_features
 
-        self.classifier = nn.Linear(self.features_dim, num_classes)
-
+        
+        num_tasks = self.extra_args.get('num_tasks')
+        self.classifier = {task : nn.Linear(self.features_dim, num_classes//num_tasks) for task in range(num_tasks)}
+        self.classifier.update({'All': nn.Linear(self.features_dim, num_classes)})                            
         if self.knn_eval:
             self.knn = WeightedKNNClassifier(k=self.knn_k, distance_fx="euclidean")
-
-        if scheduler_interval == "step":
-            warnings.warn(
-                f"Using scheduler_interval={scheduler_interval} might generate "
-                "issues when resuming a checkpoint."
-            )
-
-        # can provide up to ~20% speed up
-        if not no_channel_last:
-            self = self.to(memory_format=torch.channels_last)
-
-    def optimizer_zero_grad(self, epoch, batch_idx, optimizer, optimizer_idx):
-        """
-        This improves performance marginally. It should be fine
-        since we are not affected by any of the downsides descrited in
-        https://pytorch.org/docs/stable/generated/torch.optim.Optimizer.zero_grad.html#torch.optim.Optimizer.zero_grad
-
-        Implemented as in here
-        https://pytorch-lightning.readthedocs.io/en/1.5.10/guides/speed.html#set-grads-to-none
-        """
-
-        optimizer.zero_grad(set_to_none=True)
 
     @staticmethod
     def add_model_specific_args(parent_parser: ArgumentParser) -> ArgumentParser:
@@ -330,6 +295,7 @@ class BaseMethod(pl.LightningModule):
         # scheduler
         SUPPORTED_SCHEDULERS = [
             "reduce",
+            "cosine",
             "warmup_cosine",
             "step",
             "exponential",
@@ -341,58 +307,17 @@ class BaseMethod(pl.LightningModule):
         parser.add_argument("--min_lr", default=0.0, type=float)
         parser.add_argument("--warmup_start_lr", default=0.00003, type=float)
         parser.add_argument("--warmup_epochs", default=10, type=int)
-        parser.add_argument(
-            "--scheduler_interval", choices=["step", "epoch"], default="step", type=str
-        )
+
+        # DALI only
+        # uses sample indexes as labels and then gets the labels from a lookup table
+        # this may use more CPU memory, so just use when needed.
+        parser.add_argument("--encode_indexes_into_labels", action="store_true")
 
         # online knn eval
         parser.add_argument("--knn_eval", action="store_true")
         parser.add_argument("--knn_k", default=20, type=int)
 
-        # disables channel last optimization
-        parser.add_argument("--no_channel_last", action="store_true")
-
         return parent_parser
-
-    @property
-    def num_training_steps(self) -> int:
-        """Compute the number of training steps for each epoch."""
-
-        if self._num_training_steps is None:
-            try:
-                dataset = self.extra_args.get("dataset", None)
-                if dataset not in ["cifar10", "cifar100", "stl10"]:
-                    folder = os.path.join(self.extra_args["data_dir"], self.extra_args["train_dir"])
-                else:
-                    folder = None
-                no_labels = self.extra_args.get("no_labels", False)
-                data_fraction = self.extra_args.get("data_fraction", -1.0)
-
-                dataset_size = compute_dataset_size(
-                    dataset=dataset,
-                    folder=folder,
-                    train=True,
-                    no_labels=no_labels,
-                    data_fraction=data_fraction,
-                )
-            except:
-                raise RuntimeError(
-                    "Please pass 'dataset' or 'data_dir '"
-                    "and 'train_dir' as parameters to the model."
-                )
-
-            dataset_size = self.trainer.limit_train_batches * dataset_size
-
-            num_devices = 1
-            if isinstance(self.trainer.devices, list):
-                num_devices = len(self.trainer.devices)
-
-            effective_batch_size = (
-                self.batch_size * self.trainer.accumulate_grad_batches * num_devices
-            )
-            self._num_training_steps = dataset_size // effective_batch_size
-
-        return self._num_training_steps
 
     @property
     def learnable_params(self) -> List[Dict[str, Any]]:
@@ -402,16 +327,14 @@ class BaseMethod(pl.LightningModule):
             List[Dict[str, Any]]:
                 list of dicts containing learnable parameters and possible settings.
         """
+        
+        params = [{"name": f"classifier_{key}",
+                   "params": val.parameters(),
+                   "lr": self.classifier_lr,
+                   "weight_decay": 0,} for key, val in self.classifier.items()]
+        params += [{"name": "backbone", "params": self.backbone.parameters()}]
+        return params
 
-        return [
-            {"name": "backbone", "params": self.backbone.parameters()},
-            {
-                "name": "classifier",
-                "params": self.classifier.parameters(),
-                "lr": self.classifier_lr,
-                "weight_decay": 0,
-            },
-        ]
 
     def configure_optimizers(self) -> Tuple[List, List]:
         """Collects learnable parameters and configures the optimizer and learning rate scheduler.
@@ -456,17 +379,15 @@ class BaseMethod(pl.LightningModule):
             return optimizer
 
         if self.scheduler == "warmup_cosine":
-            scheduler = {
-                "scheduler": LinearWarmupCosineAnnealingLR(
-                    optimizer,
-                    warmup_epochs=self.warmup_epochs * self.num_training_steps,
-                    max_epochs=self.max_epochs * self.num_training_steps,
-                    warmup_start_lr=self.warmup_start_lr if self.warmup_epochs > 0 else self.lr,
-                    eta_min=self.min_lr,
-                ),
-                "interval": self.scheduler_interval,
-                "frequency": 1,
-            }
+            scheduler = LinearWarmupCosineAnnealingLR(
+                optimizer,
+                warmup_epochs=self.warmup_epochs,
+                max_epochs=self.max_epochs,
+                warmup_start_lr=self.warmup_start_lr,
+                eta_min=self.min_lr,
+            )
+        elif self.scheduler == "cosine":
+            scheduler = CosineAnnealingLR(optimizer, self.max_epochs, eta_min=self.min_lr)
         elif self.scheduler == "step":
             scheduler = MultiStepLR(optimizer, self.lr_decay_steps)
         else:
@@ -475,22 +396,21 @@ class BaseMethod(pl.LightningModule):
         if idxs_no_scheduler:
             partial_fn = partial(
                 static_lr,
-                get_lr=scheduler["scheduler"].get_lr
-                if isinstance(scheduler, dict)
-                else scheduler.get_lr,
+                get_lr=scheduler.get_lr,
                 param_group_indexes=idxs_no_scheduler,
                 lrs_to_replace=[self.lr] * len(idxs_no_scheduler),
             )
-            if isinstance(scheduler, dict):
-                scheduler["scheduler"].get_lr = partial_fn
-            else:
-                scheduler.get_lr = partial_fn
+            scheduler.get_lr = partial_fn
 
         return [optimizer], [scheduler]
 
-    def forward(self, X) -> Dict:
-        """Basic forward method. Children methods should call this function,
-        modify the ouputs (without deleting anything) and return it.
+    def forward(self, *args, **kwargs) -> Dict:
+        """Dummy forward, calls base forward."""
+
+        return self.base_forward(*args, **kwargs)
+
+    def base_forward(self, X: torch.Tensor) -> Dict:
+        """Basic forward that allows children classes to override forward().
 
         Args:
             X (torch.Tensor): batch of images in tensor format.
@@ -499,31 +419,15 @@ class BaseMethod(pl.LightningModule):
             Dict: dict of logits and features.
         """
 
-        if not self.no_channel_last:
-            X = X.to(memory_format=torch.channels_last)
         feats = self.backbone(X)
-        logits = self.classifier(feats.detach())
-        return {"logits": logits, "feats": feats}
+        logits = {head_name: head.to(feats.device)(feats.detach()) for head_name, head in self.classifier.items()} #TODO: Look for better alternatives with moving classifier to GPU
 
-    def multicrop_forward(self, X: torch.tensor) -> Dict[str, Any]:
-        """Basic multicrop forward method that performs the forward pass
-        for the multicrop views. Children classes can override this method to
-        add new outputs but should still call this function. Make sure
-        that this method and its overrides always return a dict.
+        return {
+            "logits": logits,
+            "feats": feats,
+        }
 
-        Args:
-            X (torch.Tensor): batch of images in tensor format.
-
-        Returns:
-            Dict: dict of features.
-        """
-
-        if not self.no_channel_last:
-            X = X.to(memory_format=torch.channels_last)
-        feats = self.backbone(X)
-        return {"feats": feats}
-
-    def _base_shared_step(self, X: torch.Tensor, targets: torch.Tensor) -> Dict:
+    def _base_shared_step(self, X: torch.Tensor, targets: torch.Tensor, targets_remapped: torch.Tensor, task_id: int) -> Dict:
         """Forwards a batch of images X and computes the classification loss, the logits, the
         features, acc@1 and acc@5.
 
@@ -535,16 +439,19 @@ class BaseMethod(pl.LightningModule):
             Dict: dict containing the classification loss, logits, features, acc@1 and acc@5.
         """
 
-        out = self(X)
-        logits = out["logits"]
+        out = self.base_forward(X)
+        logits_task_id = out["logits"][task_id]
+        logits_all_classes = out["logits"][task_id]
 
-        loss = F.cross_entropy(logits, targets, ignore_index=-1)
+
+        loss = F.cross_entropy(logits_task_id, targets_remapped, ignore_index=-1)
         # handle when the number of classes is smaller than 5
-        top_k_max = min(5, logits.size(1))
-        acc1, acc5 = accuracy_at_k(logits, targets, top_k=(1, top_k_max))
+        top_k_max = min(5, logits_task_id.size(1))
+        acc1, acc5 = accuracy_at_k(logits_task_id, targets_remapped, top_k=(1, top_k_max))
 
-        out.update({"loss": loss, "acc1": acc1, "acc5": acc5})
-        return out
+        top_k_max = min(5, logits_all_classes.size(1))
+        acc1_all, acc5_all = accuracy_at_k(logits_all_classes, targets, top_k=(1, top_k_max))  
+        return {**out, "loss": loss, "acc1": acc1, "acc5": acc5,  "acc1_all": acc1_all, "acc5_all": acc5_all}
 
     def training_step(self, batch: List[Any], batch_idx: int) -> Dict[str, Any]:
         """Training step for pytorch lightning. It does all the shared operations, such as
@@ -558,21 +465,19 @@ class BaseMethod(pl.LightningModule):
         Returns:
             Dict[str, Any]: dict with the classification loss, features and logits.
         """
-
-        _, X, targets = batch
+        _, X, targets, targets_remapped, task_id = batch
+        task_id = task_id[0].item()
 
         X = [X] if isinstance(X, torch.Tensor) else X
 
         # check that we received the desired number of crops
         assert len(X) == self.num_crops
 
-        outs = [self._base_shared_step(x, targets) for x in X[: self.num_large_crops]]
+        outs = [self._base_shared_step(x, targets, targets_remapped, task_id) for x in X[: self.num_large_crops]]
         outs = {k: [out[k] for out in outs] for k in outs[0].keys()}
 
         if self.multicrop:
-            multicrop_outs = [self.multicrop_forward(x) for x in X[self.num_large_crops :]]
-            for k in multicrop_outs[0].keys():
-                outs[k] = outs.get(k, []) + [out[k] for out in multicrop_outs]
+            outs["feats"].extend([self.backbone(x) for x in X[self.num_large_crops :]])
 
         # loss and stats
         outs["loss"] = sum(outs["loss"]) / self.num_large_crops
@@ -611,20 +516,21 @@ class BaseMethod(pl.LightningModule):
             Dict[str, Any]: dict with the batch_size (used for averaging), the classification loss
                 and accuracies.
         """
+        X, targets, targets_remapped, task_id = batch
 
-        X, targets = batch
+        task_id = task_id[0].item()
         batch_size = targets.size(0)
 
-        out = self._base_shared_step(X, targets)
+        out = self._base_shared_step(X, targets, targets_remapped, task_id)
 
         if self.knn_eval and not self.trainer.sanity_checking:
             self.knn(test_features=out.pop("feats").detach(), test_targets=targets.detach())
 
         metrics = {
-            "batch_size": batch_size,
-            "val_loss": out["loss"],
-            "val_acc1": out["acc1"],
-            "val_acc5": out["acc5"],
+            "batch_size": batch_size, 
+            f"val_loss_{task_id}": out["loss"],
+            f"val_acc1_{task_id}": out["acc1"],
+            f"val_acc5_{task_id}": out["acc5"],
         }
         return metrics
 
@@ -636,12 +542,19 @@ class BaseMethod(pl.LightningModule):
         Args:
             outs (List[Dict[str, Any]]): list of outputs of the validation step.
         """
+        log = {}
+        for e, sub_outs in enumerate(outs):
+            val_loss = weighted_mean(sub_outs, f"val_loss_{e}", "batch_size")
+            val_acc1 = weighted_mean(sub_outs, f"val_acc1_{e}", "batch_size")
+            val_acc5 = weighted_mean(sub_outs, f"val_acc5_{e}", "batch_size")
+            log.update({f"val_loss_{e}": val_loss, f"val_acc1_{e}": val_acc1, f"val_acc5_{e}": val_acc5})
+        
+        # val_loss = weighted_mean(outs, "val_loss", "batch_size")
+        # val_acc1 = weighted_mean(outs, "val_acc1", "batch_size")
+        # val_acc5 = weighted_mean(outs, "val_acc5", "batch_size")
+        
 
-        val_loss = weighted_mean(outs, "val_loss", "batch_size")
-        val_acc1 = weighted_mean(outs, "val_acc1", "batch_size")
-        val_acc5 = weighted_mean(outs, "val_acc5", "batch_size")
-
-        log = {"val_loss": val_loss, "val_acc1": val_acc1, "val_acc5": val_acc5}
+        # log = {"val_loss": val_loss, "val_acc1": val_acc1, "val_acc5": val_acc5}
 
         if self.knn_eval and not self.trainer.sanity_checking:
             val_knn_acc1, val_knn_acc5 = self.knn.compute()
@@ -766,19 +679,14 @@ class BaseMomentumMethod(BaseMethod):
         self.last_step = 0
 
     @torch.no_grad()
-    def momentum_forward(self, X: torch.Tensor) -> Dict[str, Any]:
-        """Momentum forward method. Children methods should call this function,
-        modify the ouputs (without deleting anything) and return it.
-
+    def base_momentum_forward(self, X: torch.Tensor) -> Dict:
+        """Momentum forward that allows children classes to override how the momentum backbone is used.
         Args:
             X (torch.Tensor): batch of images in tensor format.
-
         Returns:
             Dict: dict of logits and features.
         """
 
-        if not self.no_channel_last:
-            X = X.to(memory_format=torch.channels_last)
         feats = self.momentum_backbone(X)
         return {"feats": feats}
 
@@ -796,7 +704,7 @@ class BaseMomentumMethod(BaseMethod):
                 acc@5 of the momentum backbone / classifier.
         """
 
-        out = self.momentum_forward(X)
+        out = self.base_momentum_forward(X)
 
         if self.momentum_classifier is not None:
             feats = out["feats"]
@@ -857,8 +765,7 @@ class BaseMomentumMethod(BaseMethod):
             # adds the momentum classifier loss together with the general loss
             outs["loss"] += momentum_outs["momentum_loss"]
 
-        outs.update(momentum_outs)
-        return outs
+        return {**outs, **momentum_outs}
 
     def on_train_batch_end(
         self, outputs: Dict[str, Any], batch: Sequence[Any], batch_idx: int, dataloader_idx: int
@@ -885,7 +792,10 @@ class BaseMomentumMethod(BaseMethod):
             cur_step = self.trainer.global_step
             if self.trainer.accumulate_grad_batches:
                 cur_step = cur_step * self.trainer.accumulate_grad_batches
-            self.momentum_updater.update_tau(cur_step=cur_step, max_steps=self.num_training_steps)
+            self.momentum_updater.update_tau(
+                cur_step=cur_step,
+                max_steps=len(self.trainer.train_dataloader) * self.trainer.max_epochs,
+            )
         self.last_step = self.trainer.global_step
 
     def validation_step(

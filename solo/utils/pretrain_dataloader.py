@@ -80,19 +80,19 @@ class GaussianBlur:
 
         self.sigma = sigma
 
-    def __call__(self, img: Image) -> Image:
+    def __call__(self, x: torch.Tensor) -> torch.Tensor:
         """Applies gaussian blur to an input image.
 
         Args:
-            img (Image): an image in the PIL.Image format.
+            x (torch.Tensor): an image in the tensor format.
 
         Returns:
-            Image: blurred image.
+            torch.Tensor: returns a blurred image.
         """
 
         sigma = random.uniform(self.sigma[0], self.sigma[1])
-        img = img.filter(ImageFilter.GaussianBlur(radius=sigma))
-        return img
+        x = x.filter(ImageFilter.GaussianBlur(radius=sigma))
+        return x
 
 
 class Solarization:
@@ -105,7 +105,7 @@ class Solarization:
             img (Image): an image in the PIL.Image format.
 
         Returns:
-            Image: solarized image.
+            Image: a solarized image.
         """
 
         return ImageOps.solarize(img)
@@ -478,7 +478,6 @@ def prepare_datasets(
     train_dir: Optional[Union[str, Path]] = None,
     no_labels: Optional[Union[str, Path]] = False,
     download: bool = True,
-    data_fraction: float = -1.0,
 ) -> Dataset:
     """Prepares the desired dataset.
 
@@ -490,8 +489,7 @@ def prepare_datasets(
         train_dir (Optional[Union[str, Path]], optional): training data directory
             to be appended to data_dir. Defaults to None.
         no_labels (Optional[bool], optional): if the custom dataset has no labels.
-        data_fraction (Optional[float]): percentage of data to use. Use all data when set to -1.0.
-            Defaults to -1.0.
+
     Returns:
         Dataset: the desired dataset with transformations.
     """
@@ -512,6 +510,16 @@ def prepare_datasets(
             train=True,
             download=download,
             transform=transform,
+        )
+
+        mean = (0.4914, 0.4822, 0.4465)
+        std = (0.2470, 0.2435, 0.2616)
+        val_dataset = DatasetClass(
+            data_dir / train_dir,
+            train=False,
+            download=download,
+            transform= transforms.Compose([transforms.ToTensor(),
+                        transforms.Normalize(mean, std)])
         )
 
     elif dataset == "stl10":
@@ -536,20 +544,7 @@ def prepare_datasets(
 
         train_dataset = dataset_with_index(dataset_class)(train_dir, transform)
 
-    if data_fraction > 0:
-        assert data_fraction < 1, "Only use data_fraction for values smaller than 1."
-        data = train_dataset.samples
-        files = [f for f, _ in data]
-        labels = [l for _, l in data]
-
-        from sklearn.model_selection import train_test_split
-
-        files, _, labels, _ = train_test_split(
-            files, labels, train_size=data_fraction, stratify=labels, random_state=42
-        )
-        train_dataset.samples = [tuple(p) for p in zip(files, labels)]
-
-    return train_dataset
+    return train_dataset, val_dataset
 
 
 def prepare_dataloader(
